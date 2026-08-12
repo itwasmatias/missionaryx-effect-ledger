@@ -18,6 +18,7 @@ from missionaryx_ledger.errors import (
 from missionaryx_ledger.models import (
     AuthorityDisposition,
     AuthorityReservation,
+    EvidenceReference,
     Effect,
     EffectIntent,
     EffectStatus,
@@ -95,12 +96,33 @@ class EffectLedger:
                 CREATE INDEX IF NOT EXISTS idx_events_effect_id ON ledger_events(effect_id)
             """)
 
+            # Enforce the append-only contract at the database boundary. These
+            # triggers block ordinary UPDATE/DELETE statements, including ones
+            # issued outside the public Python API.
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS ledger_events_reject_update
+                BEFORE UPDATE ON ledger_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'ledger_events is append-only');
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS ledger_events_reject_delete
+                BEFORE DELETE ON ledger_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'ledger_events is append-only');
+                END
+            """)
+
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         """Context manager for atomic transactions."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
@@ -114,19 +136,22 @@ class EffectLedger:
         conn: sqlite3.Connection,
         effect_id: str,
         event_type: str,
-        evidence_reference: str | None = None,
+        evidence_reference: EvidenceReference | None = None,
         metadata: dict | None = None,
     ) -> None:
         """Append an event to the timeline (within a transaction)."""
         timestamp = datetime.now(timezone.utc).isoformat()
         metadata_json = json.dumps(metadata) if metadata else None
+        evidence_json = evidence_reference.to_json() if evidence_reference else None
 
         conn.execute(
             """
-            INSERT INTO ledger_events (effect_id, event_type, timestamp, evidence_reference, metadata_json)
+            INSERT INTO ledger_events (
+                effect_id, event_type, timestamp, evidence_reference, metadata_json
+            )
             VALUES (?, ?, ?, ?, ?)
             """,
-            (effect_id, event_type, timestamp, evidence_reference, metadata_json),
+            (effect_id, event_type, timestamp, evidence_json, metadata_json),
         )
 
     def commit_intent(self, intent: EffectIntent) -> None:
@@ -163,7 +188,9 @@ class EffectLedger:
                 (intent.idempotency_key,),
             ).fetchone()
             if existing_idem:
-                raise IdempotencyKeyConflictError(intent.idempotency_key, existing_idem["effect_id"])
+                raise IdempotencyKeyConflictError(
+                    intent.idempotency_key, existing_idem["effect_id"]
+                )
 
             # Insert effect
             conn.execute(
@@ -191,7 +218,9 @@ class EffectLedger:
             # Create authority reservation
             conn.execute(
                 """
-                INSERT INTO authority_reservations (authority_id, effect_id, disposition, reserved_at)
+                INSERT INTO authority_reservations (
+                    authority_id, effect_id, disposition, reserved_at
+                )
                 VALUES (?, ?, ?, ?)
                 """,
                 (
@@ -260,6 +289,9 @@ class EffectLedger:
             EffectNotFoundError: If effect doesn't exist
             InvalidStateTransitionError: If not dispatched
         """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-blank string")
+
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT status FROM effects WHERE effect_id = ?", (effect_id,)
@@ -305,7 +337,7 @@ class EffectLedger:
             self._append_event(conn, effect_id, "fail_safe_plan_mode_entered")
 
     def reconcile(self, effect_id: str, reconciler: Reconciler) -> ReconciliationResult:
-        """Reconcile an effect using verified evidence.
+        """Reconcile a dispatched effect using structured evidence.
 
         Args:
             effect_id: ID of the effect to reconcile
@@ -318,29 +350,48 @@ class EffectLedger:
             EffectNotFoundError: If effect doesn't exist
             ReconciliationError: If reconciliation fails
         """
-        # First get the intent
+        # First get the intent and reject illegal lifecycle states before
+        # recording an attempt or invoking an external reconciler.
         intent = self._get_intent(effect_id)
 
-        # Start reconciliation event outside transaction
         with self._transaction() as conn:
+            self._require_reconcilable_status(conn, effect_id)
             self._append_event(conn, effect_id, "reconciliation_started")
 
         # Call reconciler (may be slow, outside transaction)
         try:
             result = reconciler.reconcile(intent)
         except Exception as e:
-            # Record failure
+            # Record only the exception type: provider messages can contain
+            # credentials or personal data.
             with self._transaction() as conn:
                 self._append_event(
                     conn,
                     effect_id,
                     "reconciliation_failed",
-                    metadata={"error": str(e)},
+                    metadata={"error_type": type(e).__name__},
                 )
-            raise ReconciliationError(f"Reconciliation failed: {e}", effect_id=effect_id) from e
+            raise ReconciliationError(
+                f"Reconciliation failed with {type(e).__name__}", effect_id=effect_id
+            ) from e
 
-        # Apply result atomically
-        with self._transaction() as conn:
+        if not isinstance(result, ReconciliationResult):
+            raise ReconciliationError(
+                "Reconciler must return a ReconciliationResult", effect_id=effect_id
+            )
+
+        evidence = result.evidence_reference
+        if evidence is not None and evidence.subject_idempotency_key != intent.idempotency_key:
+            raise ReconciliationError(
+                "Evidence subject does not match the effect idempotency key",
+                effect_id=effect_id,
+            )
+
+        # Re-read under a write lock and apply with a status guard. A competing
+        # reconciliation that reached a terminal state first makes this result
+        # stale and therefore ineligible to mutate state or authority.
+        with self._transaction(immediate=True) as conn:
+            self._require_reconcilable_status(conn, effect_id)
             if result.finding == EffectStatus.NOTHING_LANDED:
                 self._apply_nothing_landed(conn, effect_id, result)
             elif result.finding == EffectStatus.SOMETHING_LANDED:
@@ -350,43 +401,98 @@ class EffectLedger:
 
         return result
 
+    @staticmethod
+    def _require_reconcilable_status(
+        conn: sqlite3.Connection, effect_id: str
+    ) -> EffectStatus:
+        """Return current status or reject a pre-dispatch/terminal reconciliation."""
+        row = conn.execute(
+            "SELECT status FROM effects WHERE effect_id = ?", (effect_id,)
+        ).fetchone()
+        if not row:
+            raise EffectNotFoundError(effect_id)
+
+        status = EffectStatus(row["status"])
+        allowed = {
+            EffectStatus.DISPATCHED_UNCONFIRMED,
+            EffectStatus.INDETERMINATE,
+        }
+        if status not in allowed:
+            raise InvalidStateTransitionError(
+                f"Cannot reconcile from status {status.value}", effect_id=effect_id
+            )
+        return status
+
+    @staticmethod
+    def _update_authority_for_resolution(
+        conn: sqlite3.Connection,
+        effect_id: str,
+        disposition: AuthorityDisposition,
+        changed_at: str,
+    ) -> None:
+        """Atomically move pending authority to its terminal disposition."""
+        cursor = conn.execute(
+            """
+            UPDATE authority_reservations
+            SET disposition = ?, disposition_changed_at = ?
+            WHERE effect_id = ? AND disposition IN (?, ?)
+            """,
+            (
+                disposition.value,
+                changed_at,
+                effect_id,
+                AuthorityDisposition.RESERVED.value,
+                AuthorityDisposition.HELD_UNRECONCILED.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ReconciliationError(
+                "Authority is not pending reconciliation", effect_id=effect_id
+            )
+
     def _apply_nothing_landed(
         self, conn: sqlite3.Connection, effect_id: str, result: ReconciliationResult
     ) -> None:
         """Apply nothing_landed reconciliation result."""
         resolved_at = datetime.now(timezone.utc).isoformat()
+        evidence = result.evidence_reference
+        if evidence is None:  # Guard for callers bypassing dataclass validation.
+            raise ReconciliationError("Terminal result requires evidence", effect_id=effect_id)
 
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE effects
             SET status = ?, mode = ?, resolved_at = ?, reconciliation_evidence = ?
-            WHERE effect_id = ?
+            WHERE effect_id = ? AND status IN (?, ?)
             """,
             (
                 EffectStatus.NOTHING_LANDED.value,
                 ExecutionMode.ACTIVE.value,
                 resolved_at,
-                result.evidence_reference,
+                evidence.to_json(),
                 effect_id,
+                EffectStatus.DISPATCHED_UNCONFIRMED.value,
+                EffectStatus.INDETERMINATE.value,
             ),
         )
+        if cursor.rowcount != 1:
+            raise InvalidStateTransitionError(
+                "Reconciliation result became stale", effect_id=effect_id
+            )
 
         # Release authority
-        changed_at = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """
-            UPDATE authority_reservations
-            SET disposition = ?, disposition_changed_at = ?
-            WHERE effect_id = ?
-            """,
-            (AuthorityDisposition.RELEASED.value, changed_at, effect_id),
+        self._update_authority_for_resolution(
+            conn,
+            effect_id,
+            AuthorityDisposition.RELEASED,
+            datetime.now(timezone.utc).isoformat(),
         )
 
         self._append_event(
             conn,
             effect_id,
             "reconciled_nothing_landed",
-            evidence_reference=result.evidence_reference,
+            evidence_reference=evidence,
             metadata={"explanation": result.explanation},
         )
 
@@ -395,38 +501,44 @@ class EffectLedger:
     ) -> None:
         """Apply something_landed reconciliation result."""
         resolved_at = datetime.now(timezone.utc).isoformat()
+        evidence = result.evidence_reference
+        if evidence is None:  # Guard for callers bypassing dataclass validation.
+            raise ReconciliationError("Terminal result requires evidence", effect_id=effect_id)
 
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE effects
             SET status = ?, mode = ?, resolved_at = ?, reconciliation_evidence = ?
-            WHERE effect_id = ?
+            WHERE effect_id = ? AND status IN (?, ?)
             """,
             (
                 EffectStatus.SOMETHING_LANDED.value,
                 ExecutionMode.ACTIVE.value,
                 resolved_at,
-                result.evidence_reference,
+                evidence.to_json(),
                 effect_id,
+                EffectStatus.DISPATCHED_UNCONFIRMED.value,
+                EffectStatus.INDETERMINATE.value,
             ),
         )
+        if cursor.rowcount != 1:
+            raise InvalidStateTransitionError(
+                "Reconciliation result became stale", effect_id=effect_id
+            )
 
         # Consume authority
-        changed_at = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """
-            UPDATE authority_reservations
-            SET disposition = ?, disposition_changed_at = ?
-            WHERE effect_id = ?
-            """,
-            (AuthorityDisposition.CONSUMED.value, changed_at, effect_id),
+        self._update_authority_for_resolution(
+            conn,
+            effect_id,
+            AuthorityDisposition.CONSUMED,
+            datetime.now(timezone.utc).isoformat(),
         )
 
         self._append_event(
             conn,
             effect_id,
             "reconciled_something_landed",
-            evidence_reference=result.evidence_reference,
+            evidence_reference=evidence,
             metadata={"explanation": result.explanation},
         )
 
@@ -434,12 +546,52 @@ class EffectLedger:
         self, conn: sqlite3.Connection, effect_id: str, result: ReconciliationResult
     ) -> None:
         """Apply still-indeterminate reconciliation result."""
-        # State remains indeterminate, fail-safe plan mode, held unreconciled
+        # A direct reconciliation of dispatched_unconfirmed may itself discover
+        # uncertainty. Enter fail-safe mode and hold authority in that case.
+        cursor = conn.execute(
+            """
+            UPDATE effects
+            SET status = ?, mode = ?
+            WHERE effect_id = ? AND status IN (?, ?)
+            """,
+            (
+                EffectStatus.INDETERMINATE.value,
+                ExecutionMode.FAIL_SAFE_PLAN_MODE.value,
+                effect_id,
+                EffectStatus.DISPATCHED_UNCONFIRMED.value,
+                EffectStatus.INDETERMINATE.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise InvalidStateTransitionError(
+                "Reconciliation result became stale", effect_id=effect_id
+            )
+
+        changed_at = datetime.now(timezone.utc).isoformat()
+        authority_cursor = conn.execute(
+            """
+            UPDATE authority_reservations
+            SET disposition = ?, disposition_changed_at = ?
+            WHERE effect_id = ? AND disposition IN (?, ?)
+            """,
+            (
+                AuthorityDisposition.HELD_UNRECONCILED.value,
+                changed_at,
+                effect_id,
+                AuthorityDisposition.RESERVED.value,
+                AuthorityDisposition.HELD_UNRECONCILED.value,
+            ),
+        )
+        if authority_cursor.rowcount != 1:
+            raise ReconciliationError(
+                "Authority is not pending reconciliation", effect_id=effect_id
+            )
+
         self._append_event(
             conn,
             effect_id,
             "reconciliation_still_indeterminate",
-            evidence_reference=result.evidence_reference if result.evidence_reference else None,
+            evidence_reference=result.evidence_reference,
             metadata={"explanation": result.explanation},
         )
 
@@ -501,9 +653,21 @@ class EffectLedger:
                 intent=intent,
                 status=EffectStatus(row["status"]),
                 mode=ExecutionMode(row["mode"]),
-                dispatched_at=datetime.fromisoformat(row["dispatched_at"]) if row["dispatched_at"] else None,
-                resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
-                reconciliation_evidence=row["reconciliation_evidence"],
+                dispatched_at=(
+                    datetime.fromisoformat(row["dispatched_at"])
+                    if row["dispatched_at"]
+                    else None
+                ),
+                resolved_at=(
+                    datetime.fromisoformat(row["resolved_at"])
+                    if row["resolved_at"]
+                    else None
+                ),
+                reconciliation_evidence=(
+                    EvidenceReference.from_json(row["reconciliation_evidence"])
+                    if row["reconciliation_evidence"]
+                    else None
+                ),
             )
 
     def get_authority(self, effect_id: str) -> AuthorityReservation:
@@ -576,7 +740,11 @@ class EffectLedger:
                         effect_id=row["effect_id"],
                         event_type=row["event_type"],
                         timestamp=datetime.fromisoformat(row["timestamp"]),
-                        evidence_reference=row["evidence_reference"],
+                        evidence_reference=(
+                            EvidenceReference.from_json(row["evidence_reference"])
+                            if row["evidence_reference"]
+                            else None
+                        ),
                         metadata=metadata,
                     )
                 )

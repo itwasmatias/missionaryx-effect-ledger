@@ -3,20 +3,20 @@
 from dataclasses import dataclass
 from typing import Protocol
 
-from missionaryx_ledger.models import EffectIntent, EffectStatus
+from missionaryx_ledger.models import EvidenceReference, EffectIntent, EffectStatus
 
 
 @dataclass(frozen=True)
 class ReconciliationResult:
     """Result of attempting to reconcile an effect's true state.
 
-    The evidence_reference must be non-empty for terminal resolutions
-    (nothing_landed or something_landed). It should point to provider
-    records, logs, or other authoritative sources.
+    Terminal resolutions require a structured evidence reference. The ledger
+    validates its shape and effect binding; the reconciler remains responsible
+    for authenticating the provider and truthfully constructing the reference.
     """
 
     finding: EffectStatus  # Must be nothing_landed, something_landed, or indeterminate
-    evidence_reference: str  # Required for terminal findings, describes the proof
+    evidence_reference: EvidenceReference | None
     explanation: str  # Human-readable description
     metadata: dict[str, str] | None = None
 
@@ -34,15 +34,20 @@ class ReconciliationResult:
                 f"or indeterminate, got {self.finding}"
             )
 
-        # Terminal findings require non-empty evidence
+        # Terminal findings require structured evidence provenance.
         if self.finding in {EffectStatus.NOTHING_LANDED, EffectStatus.SOMETHING_LANDED}:
-            if not self.evidence_reference:
+            if not isinstance(self.evidence_reference, EvidenceReference):
                 raise ValueError(
-                    f"Terminal finding {self.finding.value} requires non-empty evidence_reference"
+                    f"Terminal finding {self.finding.value} requires an EvidenceReference"
                 )
 
-        if not self.explanation:
-            raise ValueError("explanation must be non-empty")
+        if self.evidence_reference is not None and not isinstance(
+            self.evidence_reference, EvidenceReference
+        ):
+            raise ValueError("evidence_reference must be an EvidenceReference or None")
+
+        if not isinstance(self.explanation, str) or not self.explanation.strip():
+            raise ValueError("explanation must be a non-blank string")
 
 
 class Reconciler(Protocol):

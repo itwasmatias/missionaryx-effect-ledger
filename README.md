@@ -38,8 +38,8 @@ The MissionaryX Effect Ledger treats task status and effect status as **separate
 
 Every real-world action ends in one of three states:
 
-1. **`nothing_landed`** - Provably did not execute (with evidence)
-2. **`something_landed`** - Provably did execute (with evidence)
+1. **`nothing_landed`** - Evidence supports that it did not execute
+2. **`something_landed`** - Evidence supports that it did execute
 3. **`indeterminate`** - Cannot prove either way (yet)
 
 ### Key Principles
@@ -47,13 +47,33 @@ Every real-world action ends in one of three states:
 1. **Intent before dispatch** - Effect intent is committed atomically before any dispatch attempt
 2. **Authority reservation** - Each effect reserves specific authority that cannot be double-spent
 3. **Honest indeterminacy** - Lost confirmation is modeled as `indeterminate`, not as failure
-4. **Evidence-based resolution** - Only verified evidence from providers can resolve indeterminate effects
+4. **Evidence-bound resolution** - Terminal findings require structured provenance bound to the effect
 5. **Fail-safe mode** - Indeterminate effects enter fail-safe plan mode and cannot auto-retry
-6. **Append-only timeline** - All state changes are recorded as immutable events
+6. **Append-only timeline** - SQLite triggers reject event updates and deletions
+
+### Evidence Trust Boundary
+
+MissionaryX distinguishes three evidence kinds:
+
+- **`enforced`** - A property guaranteed by a control at the system boundary
+- **`attested`** - A claim made by a provider or other external authority
+- **`observed`** - A record captured by an observer
+
+A terminal reconciliation must carry an `EvidenceReference` with its kind, source,
+record identifier, observation time, SHA-256 artifact digest, and the effect's exact
+idempotency key. The ledger validates that structure and binding before changing
+state or authority.
+
+This standalone artifact does **not** authenticate a provider or independently prove
+that an attestation is true. That is the reconciler's explicit trust boundary. A
+production reconciler must authenticate its provider and verify or capture the
+referenced artifact before returning a terminal result.
 
 ## Email Connection-Loss Example
 
 ```python
+import hashlib
+
 from missionaryx_ledger import EffectLedger, EffectIntent
 from missionaryx_ledger.simulated_provider import SimulatedEmailProvider
 
@@ -67,7 +87,7 @@ intent = EffectIntent(
     authority_id="email-quota-batch-5",
     operation="email.send",
     target="user@example.com",
-    payload_digest="a7f3...",  # SHA-256, never raw content
+    payload_digest=hashlib.sha256(b"Welcome email body").hexdigest(),
     idempotency_key="welcome-email-user-123",
 )
 ledger.commit_intent(intent)
@@ -96,7 +116,7 @@ except ConnectionError:
 # Later: reconcile with provider evidence
 result = ledger.reconcile(intent.effect_id, provider)
 # Finding: something_landed OR indeterminate
-# Evidence: provider delivery logs, receipts, or unavailability notice
+# Evidence: structured, effect-bound provider attestation or observation
 # Authority: consumed (if landed) or still held (if still indeterminate)
 ```
 
@@ -140,7 +160,7 @@ missionaryx-ledger demo connection-loss
 or
 
 ```bash
-python -m missionaryx_ledger.demo connection-loss
+python -m missionaryx_ledger demo connection-loss
 ```
 
 This demonstrates:
@@ -185,10 +205,11 @@ Demonstrates successful delivery → `something_landed` with evidence.
 - Contains operation, target, payload digest, idempotency key
 - Never stores raw sensitive payloads
 
-**`Reconciler` Protocol** - Evidence-based reconciliation
+**`Reconciler` Protocol** - Evidence-based reconciliation trust boundary
 - Queries provider state using idempotency keys
-- Returns finding with evidence reference
+- Returns a finding with structured provenance and artifact binding
 - Supports `nothing_landed`, `something_landed`, or `indeterminate`
+- Remains responsible for authenticating the provider and evidence
 
 **`SimulatedEmailProvider`** - Deterministic test provider
 - Never makes network calls
@@ -200,8 +221,8 @@ Demonstrates successful delivery → `something_landed` with evidence.
 **Effect Status:**
 - `committed_not_dispatched` - Intent recorded, not yet dispatched
 - `dispatched_unconfirmed` - Dispatch recorded, awaiting outcome
-- `nothing_landed` - Provably did not execute (terminal, with evidence)
-- `something_landed` - Provably did execute (terminal, with evidence)
+- `nothing_landed` - Evidence supports non-execution (terminal)
+- `something_landed` - Evidence supports execution (terminal)
 - `indeterminate` - Cannot prove outcome (may resolve later)
 
 **Execution Mode:**
@@ -218,9 +239,12 @@ Demonstrates successful delivery → `something_landed` with evidence.
 
 **`effects` table** - Effect intents and current state
 **`authority_reservations` table** - Authority lifecycle tracking
-**`ledger_events` table** - Append-only event timeline
+**`ledger_events` table** - Append-only event timeline protected by update/delete triggers
 
 All tables use explicit transactions. No state change occurs without a corresponding event record.
+Foreign-key checks are enabled on every ledger connection. The triggers block ordinary
+SQL mutation of events; they are not a cryptographic tamper-evidence mechanism and do
+not protect against a database owner who can alter the schema.
 
 ## Reliability Invariants (Proven by Tests)
 
@@ -234,8 +258,12 @@ All tables use explicit transactions. No state change occurs without a correspon
 ✓ Indeterminate effect cannot be dispatched/retried again
 ✓ Indeterminate authority cannot be reused or released by timeout
 ✓ Fail-safe plan mode remains until reconciliation resolves
-✓ Terminal reconciliation requires non-empty evidence reference
-✓ Event records are chronological and append-only
+✓ Reconciliation before dispatch is rejected without invoking the reconciler
+✓ Terminal outcomes are absorbing and cannot reverse authority disposition
+✓ Competing reconciliation results cannot overwrite the terminal winner
+✓ Terminal reconciliation requires typed, effect-bound evidence provenance
+✓ Blank, malformed, and mismatched evidence is rejected
+✓ Event records are chronological and database-enforced append-only
 ✓ Illegal state transitions raise errors and leave state unchanged
 
 ## Non-Goals
@@ -247,6 +275,7 @@ This package is a **focused demonstration** of agent reliability principles. It 
 - Provide a complete agent framework
 - Implement distributed consensus or multi-node coordination
 - Guarantee legal admissibility of evidence
+- Authenticate provider attestations in this simulated standalone package
 - Claim exactly-once delivery (it models honest uncertainty)
 - Provide production-grade encryption or access control
 
@@ -257,6 +286,10 @@ For production use, you would need:
 - Access controls and audit logging
 - Distributed transaction coordination
 - Real provider integrations
+
+The SQLite database contains operational metadata such as targets, idempotency keys,
+timestamps, explanations, and evidence locators. Treat the database as potentially
+sensitive even though raw message bodies and credentials are not stored.
 
 ## CLI Reference
 
@@ -287,8 +320,9 @@ This package demonstrates a specific position on AI agent reliability:
 **Evidence:** The test suite proves that:
 1. Authority cannot be double-spent during indeterminacy
 2. Indeterminate effects cannot auto-retry
-3. Resolution requires explicit evidence
-4. All transitions are auditable
+3. Resolution requires structured evidence bound to the exact effect
+4. Terminal outcomes cannot be reversed by stale or competing reconciliation
+5. Event updates and deletions are rejected at the database boundary
 
 The implementation prioritizes **conceptual clarity** over **production scale**. It uses SQLite, deterministic simulations, and focused scenarios to make the reliability mechanism visible.
 

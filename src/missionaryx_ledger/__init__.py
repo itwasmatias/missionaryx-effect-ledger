@@ -5,6 +5,8 @@ from missionaryx_ledger.models import (
     EffectStatus,
     ExecutionMode,
     AuthorityDisposition,
+    EvidenceKind,
+    EvidenceReference,
     LedgerEvent,
     AuthorityReservation,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "EffectStatus",
     "ExecutionMode",
     "AuthorityDisposition",
+    "EvidenceKind",
+    "EvidenceReference",
     "LedgerEvent",
     "AuthorityReservation",
     "LedgerError",

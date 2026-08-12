@@ -4,11 +4,12 @@ This provider never makes network calls. It simulates different
 scenarios for testing and demonstration.
 """
 
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
-from missionaryx_ledger.models import EffectIntent, EffectStatus
+from missionaryx_ledger.models import EvidenceKind, EvidenceReference, EffectIntent, EffectStatus
 from missionaryx_ledger.reconciliation import ReconciliationResult, Reconciler
 
 
@@ -44,6 +45,25 @@ class SimulatedEmailProvider(Reconciler):
         self._deliveries: dict[str, SimulatedDelivery] = {}
         self._dispatch_attempts: dict[str, int] = {}
 
+    @staticmethod
+    def _evidence(
+        intent: EffectIntent,
+        record_id: str,
+        artifact: str,
+        *,
+        kind: EvidenceKind = EvidenceKind.ATTESTED,
+        observed_at: datetime | None = None,
+    ) -> EvidenceReference:
+        """Build structured, effect-bound evidence for a simulated record."""
+        return EvidenceReference(
+            kind=kind,
+            source="simulated-email-provider",
+            record_id=record_id,
+            subject_idempotency_key=intent.idempotency_key,
+            artifact_digest=hashlib.sha256(artifact.encode("utf-8")).hexdigest(),
+            observed_at=observed_at or datetime.now(timezone.utc),
+        )
+
     def dispatch(self, intent: EffectIntent) -> tuple[bool, str | None]:
         """Simulate dispatching an email.
 
@@ -59,7 +79,7 @@ class SimulatedEmailProvider(Reconciler):
         )
 
         if self.scenario == "invalid_address":
-            return False, f"Invalid address: {intent.target}"
+            return False, "Provider rejected the supplied address as invalid"
 
         elif self.scenario == "accepted":
             # Record delivery
@@ -104,8 +124,12 @@ class SimulatedEmailProvider(Reconciler):
             # Provider rejected immediately - provably not delivered
             return ReconciliationResult(
                 finding=EffectStatus.NOTHING_LANDED,
-                evidence_reference=f"provider-rejection-log:{intent.target}",
-                explanation=f"Provider rejected invalid address: {intent.target}",
+                evidence_reference=self._evidence(
+                    intent,
+                    record_id=f"provider-rejection-log:{intent.idempotency_key}",
+                    artifact=f"rejected|invalid-address|{intent.idempotency_key}",
+                ),
+                explanation="Provider attested that the supplied address was rejected as invalid.",
             )
 
         elif self.scenario == "accepted":
@@ -114,16 +138,31 @@ class SimulatedEmailProvider(Reconciler):
             if delivery:
                 return ReconciliationResult(
                     finding=EffectStatus.SOMETHING_LANDED,
-                    evidence_reference=f"delivery-receipt:{delivery.delivery_id}",
-                    explanation=f"Email delivered to {intent.target} at {delivery.delivered_at.isoformat()}",
+                    evidence_reference=self._evidence(
+                        intent,
+                        record_id=f"delivery-receipt:{delivery.delivery_id}",
+                        artifact=(
+                            f"delivered|{delivery.delivery_id}|"
+                            f"{delivery.delivered_at.isoformat()}"
+                        ),
+                        observed_at=delivery.delivered_at,
+                    ),
+                    explanation=(
+                        f"Provider attested delivery at "
+                        f"{delivery.delivered_at.isoformat()}."
+                    ),
                     metadata={"delivery_id": delivery.delivery_id},
                 )
             else:
                 # Not found in delivery records - nothing landed
                 return ReconciliationResult(
                     finding=EffectStatus.NOTHING_LANDED,
-                    evidence_reference=f"provider-query-log:not-found:{intent.idempotency_key}",
-                    explanation=f"No delivery record found for idempotency key {intent.idempotency_key}",
+                    evidence_reference=self._evidence(
+                        intent,
+                        record_id=f"provider-query-log:not-found:{intent.idempotency_key}",
+                        artifact=f"not-found|{intent.idempotency_key}",
+                    ),
+                    explanation="Provider attested that no matching delivery record exists.",
                 )
 
         elif self.scenario == "connection_loss_after_possible_acceptance":
@@ -132,8 +171,16 @@ class SimulatedEmailProvider(Reconciler):
             if delivery:
                 return ReconciliationResult(
                     finding=EffectStatus.SOMETHING_LANDED,
-                    evidence_reference=f"delayed-delivery-confirmation:{delivery.delivery_id}",
-                    explanation=f"Delayed confirmation: email was delivered to {intent.target}",
+                    evidence_reference=self._evidence(
+                        intent,
+                        record_id=f"delayed-delivery-confirmation:{delivery.delivery_id}",
+                        artifact=(
+                            f"delayed-confirmation|{delivery.delivery_id}|"
+                            f"{delivery.delivered_at.isoformat()}"
+                        ),
+                        observed_at=delivery.delivered_at,
+                    ),
+                    explanation="Provider supplied delayed confirmation that delivery occurred.",
                     metadata={"delivery_id": delivery.delivery_id},
                 )
             else:
@@ -141,7 +188,12 @@ class SimulatedEmailProvider(Reconciler):
                 # In a real system, this might happen for a while before eventual resolution
                 return ReconciliationResult(
                     finding=EffectStatus.INDETERMINATE,
-                    evidence_reference=f"provider-unavailable:{datetime.now(timezone.utc).isoformat()}",
+                    evidence_reference=self._evidence(
+                        intent,
+                        record_id="provider-availability-check:unavailable",
+                        artifact=f"provider-unavailable|{intent.idempotency_key}",
+                        kind=EvidenceKind.OBSERVED,
+                    ),
                     explanation="Provider still unavailable - cannot confirm delivery status",
                 )
 
