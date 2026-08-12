@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "MissionaryX Project"}
+    {name = "Matias Rodriguez"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -34,3 +34,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 missionaryx_ledger = ["py.typed"]
+
+[project.urls]
+Homepage = "https://github.com/itwasmatias/missionaryx-effect-ledger"
+Repository = "https://github.com/itwasmatias/missionaryx-effect-ledger"
+Issues = "https://github.com/itwasmatias/missionaryx-effect-ledger/issues"
