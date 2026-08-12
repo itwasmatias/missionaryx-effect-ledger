@@ -2,6 +2,8 @@
 
 **Honest, governed execution for AI missions.**
 
+> Read the companion technical essay: [Task Failure Is Not Effect Failure](docs/Task-Failure-Is-Not-Effect-Failure.md)
+
 ## The Problem
 
 When an AI agent reports that its task failed, that is **not proof** that its real-world action failed.
